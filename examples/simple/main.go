@@ -5,13 +5,9 @@ import (
 
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/examples/internal/signal"
-	"github.com/pion/mediadevices/pkg/codec"
 	"github.com/pion/mediadevices/pkg/frame"
 	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v2"
-
-	// This is required to use opus audio encoder
-	"github.com/pion/mediadevices/pkg/codec/opus"
 
 	// If you don't like vpx, you can also use x264 by importing as below
 	// "github.com/pion/mediadevices/pkg/codec/x264" // This is required to use h264 video encoder
@@ -23,8 +19,7 @@ import (
 	//       you can always swap your adapters with our dummy adapters below.
 	// _ "github.com/pion/mediadevices/pkg/driver/videotest"
 	// _ "github.com/pion/mediadevices/pkg/driver/audiotest"
-	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
-	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
+	_ "github.com/pion/mediadevices/pkg/driver/camera" // This is required to register camera adapter
 )
 
 const (
@@ -63,42 +58,38 @@ func main() {
 
 	md := mediadevices.NewMediaDevices(peerConnection)
 
-	opusParams, err := opus.NewParams()
-	if err != nil {
-		panic(err)
-	}
-	opusParams.BitRate = 32000 // 32kbps
-
 	vp8Params, err := vpx.NewVP8Params()
 	if err != nil {
 		panic(err)
 	}
-	vp8Params.BitRate = 100000 // 100kbps
+	vp8Params.BitRate = 300_000 // 100kbps
 
 	s, err := md.GetUserMedia(mediadevices.MediaStreamConstraints{
-		Audio: func(c *mediadevices.MediaTrackConstraints) {
-			c.Enabled = true
-			c.AudioEncoderBuilders = []codec.AudioEncoderBuilder{&opusParams}
-		},
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
 			c.Enabled = true
 			c.Width = prop.Int(640)
 			c.Height = prop.Int(480)
-			c.VideoEncoderBuilders = []codec.VideoEncoderBuilder{&vp8Params}
 		},
 	})
 	if err != nil {
 		panic(err)
 	}
 
+	rtpTrack := mediadevices.NewRTPTrack(mediadevices.WithVideoEncoders(&vp8Params))
+
 	for _, tracker := range s.GetTracks() {
-		t := tracker.Track()
 		tracker.OnEnded(func(err error) {
-			fmt.Printf("Track (ID: %s, Label: %s) ended with error: %v\n",
-				t.ID(), t.Label(), err)
+			fmt.Printf("Track (ID: %s) ended with error: %v\n",
+				tracker.ID(), err)
 		})
-		_, err = peerConnection.AddTransceiverFromTrack(t,
+
+		webrtcTrack, err := rtpTrack.Wrap(peerConnection, tracker)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = peerConnection.AddTransceiverFromTrack(webrtcTrack,
 			webrtc.RtpTransceiverInit{
 				Direction: webrtc.RTPTransceiverDirectionSendonly,
 			},

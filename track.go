@@ -1,249 +1,247 @@
 package mediadevices
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"image"
 	"math/rand"
 	"sync"
 
 	"github.com/pion/mediadevices/pkg/codec"
 	"github.com/pion/mediadevices/pkg/driver"
-	mio "github.com/pion/mediadevices/pkg/io"
+	"github.com/pion/mediadevices/pkg/io/audio"
+	"github.com/pion/mediadevices/pkg/io/video"
+	"github.com/pion/mediadevices/pkg/wave"
 	"github.com/pion/webrtc/v2"
-	"github.com/pion/webrtc/v2/pkg/media"
 )
+
+var (
+	errInvalidDriverType = errors.New("invalid driver type")
+)
+
+type Source interface {
+	ID() string
+	Close() error
+}
+
+type VideoSource interface {
+	video.Reader
+	Source
+}
+
+type AudioSource interface {
+	audio.Reader
+	Source
+}
+
+type LocalTrackContext struct {
+	PeerConnection *webrtc.PeerConnection
+}
 
 // Tracker is an interface that represent MediaStreamTrack
 // Reference: https://w3c.github.io/mediacapture-main/#mediastreamtrack
-type Tracker interface {
-	Track() *webrtc.Track
-	LocalTrack() LocalTrack
-	Stop()
-	Kind() MediaDeviceType
+type Track interface {
+	Source
 	// OnEnded registers a handler to receive an error from the media stream track.
 	// If the error is already occured before registering, the handler will be
 	// immediately called.
 	OnEnded(func(error))
+	Kind() MediaDeviceType
+	Bind(LocalTrackContext) error
+	Unbind(LocalTrackContext) error
 }
 
-type LocalTrack interface {
-	WriteSample(s media.Sample) error
-	Codec() *webrtc.RTPCodec
-	ID() string
-	Kind() webrtc.RTPCodecType
-}
-
-type track struct {
-	localTrack LocalTrack
-	d          driver.Driver
-	sample     samplerFunc
-	encoder    codec.ReadCloser
-
-	onErrorHandler func(error)
+type baseTrack struct {
+	Source
 	err            error
+	onErrorHandler func(error)
 	mu             sync.Mutex
 	endOnce        sync.Once
 	kind           MediaDeviceType
+	selector       *CodecSelector
+	activeTracks   map[*webrtc.PeerConnection]context.Context
 }
 
-func newTrack(opts *MediaDevicesOptions, d driver.Driver, constraints MediaTrackConstraints) (*track, error) {
-	var encoderBuilders []encoderBuilder
-	var rtpCodecs []*webrtc.RTPCodec
-	var buildSampler func(t LocalTrack) samplerFunc
-	var kind MediaDeviceType
-	var err error
+type VideoTrack struct {
+	*baseTrack
+	*video.Broadcaster
+}
 
-	err = d.Open()
-	if err != nil {
-		return nil, err
-	}
+type AudioTrack struct {
+	*baseTrack
+	*audio.Broadcaster
+}
 
-	switch r := d.(type) {
-	case driver.VideoRecorder:
-		kind = VideoInput
-		rtpCodecs = opts.codecs[webrtc.RTPCodecTypeVideo]
-		buildSampler = newVideoSampler
-		encoderBuilders, err = newVideoEncoderBuilders(r, constraints)
-	case driver.AudioRecorder:
-		kind = AudioInput
-		rtpCodecs = opts.codecs[webrtc.RTPCodecTypeAudio]
-		buildSampler = func(t LocalTrack) samplerFunc {
-			return newAudioSampler(t, constraints.selectedMedia.Latency)
-		}
-		encoderBuilders, err = newAudioEncoderBuilders(r, constraints)
-	default:
-		err = errors.New("newTrack: invalid driver type")
-	}
-
-	if err != nil {
-		d.Close()
-		return nil, err
-	}
-
-	for _, builder := range encoderBuilders {
-		var matchedRTPCodec *webrtc.RTPCodec
-		for _, rtpCodec := range rtpCodecs {
-			if rtpCodec.Name == builder.name {
-				matchedRTPCodec = rtpCodec
-				break
-			}
-		}
-
-		if matchedRTPCodec == nil {
-			continue
-		}
-
-		localTrack, err := opts.trackGenerator(
-			matchedRTPCodec.PayloadType,
-			rand.Uint32(),
-			d.ID(),
-			matchedRTPCodec.Type.String(),
-			matchedRTPCodec,
-		)
-		if err != nil {
-			continue
-		}
-
-		encoder, err := builder.build()
-		if err != nil {
-			continue
-		}
-
-		t := track{
-			localTrack: localTrack,
-			sample:     buildSampler(localTrack),
-			d:          d,
-			encoder:    encoder,
-			kind:       kind,
-		}
-		go t.start()
-		return &t, nil
-	}
-
-	d.Close()
-	return nil, errors.New("newTrack: failed to find a matching codec")
+func newBaseTrack(source Source, kind MediaDeviceType, selector *CodecSelector) *baseTrack {
+	return &baseTrack{Source: source, kind: kind, selector: selector}
 }
 
 // Kind returns track's kind
-func (t *track) Kind() MediaDeviceType {
-	return t.kind
+func (track *baseTrack) Kind() MediaDeviceType {
+	return track.kind
 }
 
 // OnEnded sets an error handler. When a track has been created and started, if an
 // error occurs, handler will get called with the error given to the parameter.
-func (t *track) OnEnded(handler func(error)) {
-	t.mu.Lock()
-	t.onErrorHandler = handler
-	err := t.err
-	t.mu.Unlock()
+func (track *baseTrack) OnEnded(handler func(error)) {
+	track.mu.Lock()
+	track.onErrorHandler = handler
+	err := track.err
+	track.mu.Unlock()
 
 	if err != nil && handler != nil {
 		// Already errored.
-		t.endOnce.Do(func() {
+		track.endOnce.Do(func() {
 			handler(err)
 		})
 	}
 }
 
 // onError is a callback when an error occurs
-func (t *track) onError(err error) {
-	t.mu.Lock()
-	t.err = err
-	handler := t.onErrorHandler
-	t.mu.Unlock()
+func (track *baseTrack) onError(err error) {
+	track.mu.Lock()
+	track.err = err
+	handler := track.onErrorHandler
+	track.mu.Unlock()
 
 	if handler != nil {
-		t.endOnce.Do(func() {
+		track.endOnce.Do(func() {
 			handler(err)
 		})
 	}
 }
 
-// start starts the data flow from the driver all the way to the localTrack
-func (t *track) start() {
-	var n int
-	var err error
-	buff := make([]byte, 1024)
-	for {
-		n, err = t.encoder.Read(buff)
+func (track *baseTrack) bind(ctx LocalTrackContext, encodedReader codec.ReadCloser, selectedCodec *codec.RTPCodec) error {
+	track.mu.Lock()
+	defer track.mu.Unlock()
+
+	/*
+		webrtcTrack, err := ctx.PeerConnection.NewTrack(selectedCodec.PayloadType, rand.Uint32(), track.ID(), selectedCodec.MimeType)
 		if err != nil {
-			if e, ok := err.(*mio.InsufficientBufferError); ok {
-				buff = make([]byte, 2*e.RequiredSize)
-				continue
+			return nil
+		}
+		go func() {
+			var n int
+			var err error
+			buff := make([]byte, 1024)
+			for {
+				n, err = t.encoder.Read(buff)
+				if err != nil {
+					if e, ok := err.(*mio.InsufficientBufferError); ok {
+						buff = make([]byte, 2*e.RequiredSize)
+						continue
+					}
+
+					t.onError(err)
+					return
+				}
+
+				if err := t.sample(buff[:n]); err != nil {
+					t.onError(err)
+					return
+				}
 			}
+		}()
+	*/
 
-			t.onError(err)
-			return
-		}
+	return nil
+}
 
-		if err := t.sample(buff[:n]); err != nil {
-			t.onError(err)
-			return
+func (track *baseTrack) unbind(ctx LocalTrackContext) error {
+	track.mu.Lock()
+	defer track.mu.Unlock()
+
+	return nil
+}
+
+func NewVideoTrack(source VideoSource, selector *CodecSelector) Track {
+	return newVideoTrackFromReader(source, source, selector)
+}
+
+func newVideoTrackFromReader(source Source, reader video.Reader, selector *CodecSelector) Track {
+	base := newBaseTrack(source, VideoInput, selector)
+	wrappedReader := video.ReaderFunc(func() (img image.Image, err error) {
+		img, err = reader.Read()
+		if err != nil {
+			base.onError(err)
 		}
+		return img, err
+	})
+
+	// TODO: Allow users to configure broadcaster
+	broadcaster := video.NewBroadcaster(wrappedReader, nil)
+
+	return &VideoTrack{
+		baseTrack:   base,
+		Broadcaster: broadcaster,
 	}
 }
 
-// Stop stops the underlying driver and encoder
-func (t *track) Stop() {
-	t.d.Close()
-	t.encoder.Close()
+func NewAudioTrack(source AudioSource, selector *CodecSelector) Track {
+	return newAudioTrackFromReader(source, source, selector)
 }
 
-func (t *track) Track() *webrtc.Track {
-	return t.localTrack.(*webrtc.Track)
+func newAudioTrackFromReader(source Source, reader audio.Reader, selector *CodecSelector) Track {
+	base := newBaseTrack(source, AudioInput, selector)
+	wrappedReader := audio.ReaderFunc(func() (chunk wave.Audio, err error) {
+		chunk, err = reader.Read()
+		if err != nil {
+			base.onError(err)
+		}
+		return chunk, err
+	})
+
+	// TODO: Allow users to configure broadcaster
+	broadcaster := audio.NewBroadcaster(wrappedReader, nil)
+
+	return &AudioTrack{
+		baseTrack:   base,
+		Broadcaster: broadcaster,
+	}
 }
 
-func (t *track) LocalTrack() LocalTrack {
-	return t.localTrack
+func newTrackFromDriver(d driver.Driver, constraints MediaTrackConstraints, selector *CodecSelector) (Track, error) {
+	if err := d.Open(); err != nil {
+		return nil, err
+	}
+
+	switch recorder := d.(type) {
+	case driver.VideoRecorder:
+		return newVideoTrackFromDriver(d, recorder, constraints, selector)
+	case driver.AudioRecorder:
+		return newAudioTrackFromDriver(d, recorder, constraints, selector)
+	default:
+		panic(errInvalidDriverType)
+	}
 }
 
-// encoderBuilder is a generic encoder builder that acts as a delegator for codec.VideoEncoderBuilder and
-// codec.AudioEncoderBuilder. The idea of having a delegator is to reduce redundant codes that are being
-// duplicated for managing video and audio.
-type encoderBuilder struct {
-	name  string
-	build func() (codec.ReadCloser, error)
-}
-
-// newVideoEncoderBuilders transforms video given by VideoRecorder with the video transformer that is passed through
-// constraints and create a list of generic encoder builders
-func newVideoEncoderBuilders(vr driver.VideoRecorder, constraints MediaTrackConstraints) ([]encoderBuilder, error) {
-	r, err := vr.VideoRecord(constraints.selectedMedia)
+// newVideoTrackFromDriver is an internal video track creation from driver
+func newVideoTrackFromDriver(d driver.Driver, recorder driver.VideoRecorder, constraints MediaTrackConstraints, selector *CodecSelector) (Track, error) {
+	reader, err := recorder.VideoRecord(constraints.selectedMedia)
 	if err != nil {
 		return nil, err
 	}
 
-	if constraints.VideoTransform != nil {
-		r = constraints.VideoTransform(r)
-	}
-
-	encoderBuilders := make([]encoderBuilder, len(constraints.VideoEncoderBuilders))
-	for i, b := range constraints.VideoEncoderBuilders {
-		encoderBuilders[i].name = b.RTPCodec().Name
-		encoderBuilders[i].build = func() (codec.ReadCloser, error) {
-			return b.BuildVideoEncoder(r, constraints.selectedMedia)
-		}
-	}
-	return encoderBuilders, nil
+	return newVideoTrackFromReader(d, reader, selector), nil
 }
 
-// newAudioEncoderBuilders transforms audio given by AudioRecorder with the audio transformer that is passed through
-// constraints and create a list of generic encoder builders
-func newAudioEncoderBuilders(ar driver.AudioRecorder, constraints MediaTrackConstraints) ([]encoderBuilder, error) {
-	r, err := ar.AudioRecord(constraints.selectedMedia)
+// newAudioTrackFromDriver is an internal audio track creation from driver
+func newAudioTrackFromDriver(d driver.Driver, recorder driver.AudioRecorder, constraints MediaTrackConstraints, selector *CodecSelector) (Track, error) {
+	reader, err := recorder.AudioRecord(constraints.selectedMedia)
 	if err != nil {
 		return nil, err
 	}
 
-	if constraints.AudioTransform != nil {
-		r = constraints.AudioTransform(r)
+	return newAudioTrackFromReader(d, reader, selector), nil
+}
+
+func (track *VideoTrack) Bind(ctx LocalTrackContext) error {
+	wantCodecs := ctx.PeerConnection.GetRegisteredRTPCodecs(webrtc.RTPCodecTypeVideo)
+	encodedReader, err := track.selector.selectVideoCodec(wantCodecs, track)
+	if err != nil {
+		return err
 	}
 
-	encoderBuilders := make([]encoderBuilder, len(constraints.AudioEncoderBuilders))
-	for i, b := range constraints.AudioEncoderBuilders {
-		encoderBuilders[i].name = b.RTPCodec().Name
-		encoderBuilders[i].build = func() (codec.ReadCloser, error) {
-			return b.BuildAudioEncoder(r, constraints.selectedMedia)
-		}
-	}
-	return encoderBuilders, nil
+	return nil
 }
